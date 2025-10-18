@@ -36,8 +36,9 @@ services:
     depends_on:
       - monitor-precios-srv
     volumes:
-      - ./bot:/app               # 🔥 monta todo el código local
-      - ./bot/keys:/app/keys     # credenciales Document AI
+      - ./bot:/app                 # 🔥 monta todo el código local
+      - ./bot/keys:/app/keys       # credenciales Document AI
+      - ./bot/prompts:/app/prompts # 👈 nuevo volumen para el prompt
     ports:
       - "8001:8000"              # puerto opcional para debug
 
@@ -57,4 +58,5 @@ services:
     volumes:
       - ./bot/cache:/app/cache   # logs y temporales
       - ./bot/keys:/app/keys     # credenciales Document AI
+      - ./bot/prompts:/app/prompts # 👈 también aquí el prompt externo
 
