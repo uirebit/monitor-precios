@@ -1,12 +1,12 @@
 import os
-import re
 import json
 import tempfile
 import psycopg2
 import logging
+import requests
 from datetime import datetime
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 from google.cloud import documentai
 from google.api_core.client_options import ClientOptions
 
@@ -14,10 +14,7 @@ from google.api_core.client_options import ClientOptions
 # 🔧 CONFIGURACIÓN GLOBAL
 # ============================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -27,15 +24,20 @@ DB_USER = os.getenv("DB_USER", "adm1n")
 DB_PASSWORD = os.getenv("DB_PASSWORD", "password")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+# Google Document AI
 PROJECT_ID = os.getenv("GOOGLE_PROJECT_ID", "ticket-reader-475515")
 LOCATION = os.getenv("GOOGLE_LOCATION", "eu")
 PROCESSOR_ID = os.getenv("GOOGLE_PROCESSOR_ID", "1e10d3e5409b524e")
-
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "/app/keys/ticket-reader-key.json")
 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = GOOGLE_CREDENTIALS
 
+# Ollama local
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://192.168.1.39:11434")  # o http://localhost:11434
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+
 # ============================================================
-# ⚙️ CONFIGURAR CLIENTE DOCUMENT AI
+# ⚙️ CLIENTE DOCUMENT AI
 # ============================================================
 
 client_options = ClientOptions(api_endpoint=f"{LOCATION}-documentai.googleapis.com")
@@ -43,7 +45,7 @@ docai_client = documentai.DocumentProcessorServiceClient(client_options=client_o
 processor_name = f"projects/{PROJECT_ID}/locations/{LOCATION}/processors/{PROCESSOR_ID}"
 
 # ============================================================
-# 💾 FUNCIÓN GUARDAR EN BASE DE DATOS
+# 💾 FUNCIONES DE BD
 # ============================================================
 
 def save_ticket_to_db(tienda, total_ticket, productos):
@@ -54,24 +56,18 @@ def save_ticket_to_db(tienda, total_ticket, productos):
         )
         cur = conn.cursor()
 
-        # Insertar ticket
-        cur.execute("""
-            INSERT INTO tickets (tienda, total_ticket)
-            VALUES (%s, %s) RETURNING id;
-        """, (tienda, total_ticket))
+        cur.execute("INSERT INTO tickets (tienda, total_ticket) VALUES (%s, %s) RETURNING id;", (tienda, total_ticket))
         ticket_id = cur.fetchone()[0]
 
-        # Insertar líneas
         for p in productos:
             cur.execute("""
                 INSERT INTO compras (fecha, tienda, producto, total_linea)
                 VALUES (CURRENT_DATE, %s, %s, %s);
-            """, (tienda, p.get("producto"), p.get("total", None)))
+            """, (tienda, p.get("producto"), p.get("total_linea")))
 
         conn.commit()
         cur.close()
         conn.close()
-
         logger.info(f"💾 Ticket {ticket_id} guardado ({len(productos)} líneas).")
         return ticket_id
 
@@ -80,19 +76,76 @@ def save_ticket_to_db(tienda, total_ticket, productos):
         return None
 
 # ============================================================
-# 📸 MANEJO DE FOTOS (OCR + PARSEO)
+# 🧠 FUNCIÓN: LLAMAR A LLAMA3 LOCAL
+# ============================================================
+
+def llamar_a_llama3(texto_ticket):
+    prompt = f"""
+Eres un modelo experto en interpretar tickets de supermercado en español.
+Extrae los productos, cantidades y precios del siguiente texto y devuelve SOLO un JSON válido con el formato:
+[
+  {{"producto": "nombre", "cantidad": número o null, "precio_unitario": número o null, "total_linea": número}}
+]
+
+Texto:
+\"\"\"{texto_ticket}\"\"\"
+"""
+    try:
+        response = requests.post(
+            f"{OLLAMA_URL}/api/generate",
+            json={"model": OLLAMA_MODEL, "prompt": prompt},
+            stream=True,
+            timeout=180
+        )
+
+        # Acumular la respuesta completa del stream
+        full_text = ""
+        for line in response.iter_lines():
+            if not line:
+                continue
+            try:
+                data = json.loads(line.decode("utf-8"))
+                if "response" in data:
+                    full_text += data["response"]
+                if data.get("done"):
+                    break
+            except json.JSONDecodeError:
+                continue
+
+        logger.info("🧠 --- RESPUESTA COMPLETA DE LLAMA3 ---")
+        logger.info(full_text)
+
+        # Extraer JSON dentro del texto generado
+        start = full_text.find("[")
+        end = full_text.rfind("]") + 1
+        if start == -1 or end == 0:
+            logger.warning("⚠️ No se encontró JSON en la respuesta.")
+            return []
+
+        json_text = full_text[start:end]
+        productos = json.loads(json_text)
+
+        logger.info(f"✅ {len(productos)} productos detectados por Llama3.")
+        return productos
+
+    except Exception as e:
+        logger.exception("❌ Error procesando con Llama3")
+        return []
+
+
+# ============================================================
+# 📸 PROCESAR FOTO
 # ============================================================
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        # Descargar imagen
         file = await update.message.photo[-1].get_file()
         with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
             await file.download_to_drive(tmp.name)
             local_path = tmp.name
         logger.info(f"📷 Imagen recibida: {local_path}")
 
-        # Procesar con Document AI
+        # Procesar con Google Document AI
         with open(local_path, "rb") as image:
             raw_document = {"content": image.read(), "mime_type": "image/jpeg"}
 
@@ -100,98 +153,47 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         result = docai_client.process_document(request={"name": processor_name, "raw_document": raw_document})
         doc = result.document
 
-        # Guardar respuesta completa (para depuración)
+        texto = doc.text or ""
+        logger.info(f"📄 OCR extraído ({len(texto)} caracteres).")
         os.makedirs("/app/cache", exist_ok=True)
-        with open("/app/cache/documentai_raw.json", "w", encoding="utf-8") as f:
-            f.write(documentai.Document.to_json(doc))
-        logger.info("💾 OCR completo guardado en /app/cache/documentai_raw.json")
+        with open("/app/cache/ticket_text.txt", "w", encoding="utf-8") as f:
+            f.write(texto)
+        logger.info("💾 Texto OCR guardado en /app/cache/ticket_text.txt")
 
-        # =======================
-        # 🔍 Extraer entidades principales
-        # =======================
-        tienda, fecha, total, moneda = None, None, None, None
-        raw_lines = []
+        # Procesar con Llama3 local
+        productos = llamar_a_llama3(texto)
 
-        for ent in doc.entities:
-            t, v = ent.type_.lower(), ent.mention_text.strip()
-            if "supplier_name" in t:
-                tienda = v
-            elif "receipt_date" in t:
-                fecha = v
-            elif "currency" in t:
-                moneda = v
-            elif "total_amount" in t:
-                total = v
-            elif "line_item" in t:
-                raw_lines.append(v)
+        if not productos:
+            await update.message.reply_text("⚠️ No se pudieron extraer productos del ticket.")
+            return
 
-        total_ticket = float(total.replace(",", ".")) if total else None
-        logger.info(f"🏪 Tienda: {tienda or 'Desconocida'} | 📅 Fecha: {fecha} | 💰 Total: {total_ticket} {moneda or '€'}")
-        logger.info(f"🧾 {len(raw_lines)} líneas brutas detectadas por Google.")
+        tienda = productos[0].get("tienda", "Desconocida")
+        total_ticket = sum([p.get("total_linea", 0) for p in productos if p.get("total_linea")])
 
-        # =======================
-        # 🧠 Reconstrucción simplificada de productos
-        # =======================
-        productos = []
-        i = 0
-        while i < len(raw_lines):
-            current = raw_lines[i]
-            next_line = raw_lines[i + 1] if i + 1 < len(raw_lines) else None
+        ticket_id = save_ticket_to_db(tienda, total_ticket, productos)
 
-            # Línea con texto y número
-            if re.search(r"[A-Za-zÁÉÍÓÚÑa-záéíóúñ].*\d", current):
-                productos.append({"producto": current})
-                i += 1
-                continue
-
-            # Línea + precio separado
-            if next_line and re.match(r"^[0-9]+[.,][0-9]{1,2}$", next_line):
-                productos.append({
-                    "producto": current,
-                    "total": float(next_line.replace(",", "."))
-                })
-                i += 2
-                continue
-
-            productos.append({"producto": current})
-            i += 1
-
-        # =======================
-        # 📜 LOGS LIMPIOS — solo lo importante
-        # =======================
-        logger.info("✅ Productos listos para guardar:")
-        for p in productos:
-            line = f"• {p['producto']}"
-            if p.get('total'): line += f" → {p['total']} €"
-            logger.info(line)
-
-        # Guardar en BD
-        ticket_id = save_ticket_to_db(tienda or "Desconocida", total_ticket, productos)
-
-        # Enviar resumen a Telegram
-        resumen = "\n".join([f"• {p['producto']}" for p in productos[:10]])
+        resumen = "\n".join([f"• {p['producto']} → {p.get('total_linea', '?')}€" for p in productos[:10]])
         await update.message.reply_text(
-            f"✅ Ticket de {tienda or 'desconocida'} procesado.\n"
-            f"🧾 {len(productos)} líneas detectadas\n💰 Total: {total_ticket} {moneda or '€'}\n\n"
+            f"✅ Ticket procesado correctamente.\n"
+            f"💰 Total: {total_ticket:.2f} €\n\n"
             f"{resumen}"
         )
 
         os.remove(local_path)
 
     except Exception as e:
-        logger.exception("❌ Error procesando foto")
-        await update.message.reply_text("⚠️ Error procesando el ticket, revisa los logs en consola.")
+        logger.exception("❌ Error procesando ticket")
+        await update.message.reply_text("⚠️ Error procesando el ticket. Revisa los logs.")
 
 # ============================================================
-# 🤖 BOT TELEGRAM — INICIO
+# 🚀 MAIN
 # ============================================================
 
 def main():
-    logger.info("🚀 Iniciando bot de seguimiento de precios...")
+    logger.info("🤖 Iniciando bot DocumentAI → Llama3...")
     app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.run_polling()
 
 if __name__ == "__main__":
     main()
-
