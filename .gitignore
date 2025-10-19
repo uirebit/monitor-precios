@@ -2,3 +2,4 @@ bot/keys/ticket-reader-key.json
 bot/cache/documentai_summary.json
 bot/cache/ticket_text.txt
 bot/cache
+.env
